@@ -14,6 +14,7 @@ CANAL_KEEPALIVE      = 1520896165972017393
 CANAL_BIENVENIDA     = 1517913637971427401
 CANALES_RECOMENDADOS = [1517913773854429204, 1518288067776090162, 1520857813876867142, 1520869210232979457]
 CATEGORIA_TICKETS    = 1520894082241527999
+CANAL_TICKET_LOGS    = 1520921022289936526
 ROL_VERIFICADO       = 1518285837379571852
 ROL_NO_VERIFICADO    = 1518285884188004494
 
@@ -46,11 +47,107 @@ user_msgs = defaultdict(lambda: deque(maxlen=5))
 # SISTEMA DE TICKETS
 # ─────────────────────────────────────────────
 TIPOS_TICKET = {
-    "soporte":    ("🛠️ Soporte General",       discord.Color.from_str("#5865F2")),
-    "apelar":     ("⚖️ Apelar / Reportar",      discord.Color.from_str("#E74C3C")),
-    "mafia":      ("🕵️ Crear Mafia",            discord.Color.from_str("#2C3E50")),
-    "beneficios": ("🎁 Reclamar Beneficios",    discord.Color.from_str("#F39C12")),
+    "soporte":    ("🛠️ Soporte General",    discord.Color.from_str("#5865F2")),
+    "apelar":     ("⚖️ Apelar / Reportar", discord.Color.from_str("#E74C3C")),
+    "mafia":      ("🕵️ Crear Mafia",       discord.Color.from_str("#2C3E50")),
+    "beneficios": ("🎁 Reclamar Beneficios",discord.Color.from_str("#F39C12")),
 }
+
+async def enviar_log_ticket(guild, info, motivo_cierre, cerrado_por):
+    canal_log = guild.get_channel(CANAL_TICKET_LOGS)
+    if not canal_log:
+        return
+    try:
+        owner = await bot.fetch_user(int(info.get("user_id", 0)))
+        owner_txt = f"{owner.mention} (`{owner}`)"
+    except Exception:
+        owner_txt = f"`{info.get('user_id','?')}`"
+    reclamado = info.get("reclamado_por")
+    if reclamado:
+        try:
+            st = await bot.fetch_user(int(reclamado))
+            reclamado_txt = f"{st.mention} (`{st}`)"
+        except Exception:
+            reclamado_txt = f"`{reclamado}`"
+    else:
+        reclamado_txt = "Sin reclamar"
+    e = discord.Embed(
+        title="🗂️ Ticket cerrado — Log",
+        color=discord.Color.from_str("#E74C3C"),
+        timestamp=datetime.now(timezone.utc)
+    )
+    e.add_field(name="🆔 Ticket",        value=f"`#{info.get('numero', '?'):03d}`", inline=True)
+    e.add_field(name="📋 Categoría",     value=info.get("tipo", "?"),               inline=True)
+    e.add_field(name="📅 Abierto el",    value=info.get("fecha", "?"),              inline=True)
+    e.add_field(name="👤 Usuario",       value=owner_txt,                           inline=True)
+    e.add_field(name="✋ Atendido por",  value=reclamado_txt,                       inline=True)
+    e.add_field(name="🔒 Cerrado por",   value=f"{cerrado_por.mention} (`{cerrado_por}`)", inline=True)
+    e.add_field(name="📝 Motivo cierre", value=motivo_cierre,                       inline=False)
+    e.set_footer(text=f"Cerrado el {ts()}")
+    await canal_log.send(embed=e)
+
+async def ejecutar_claim(guild, channel, staff_member, info, tdata):
+    """Actualiza permisos y guarda el claim."""
+    owner_id = int(info.get("user_id", 0))
+    owner = guild.get_member(owner_id)
+    staff_role = guild.get_role(STAFF_ROLE_ID)
+
+    # Staff en general: solo puede ver, no escribir
+    if staff_role:
+        try:
+            await channel.set_permissions(staff_role,
+                view_channel=True, send_messages=False, read_message_history=True)
+        except Exception:
+            pass
+    # El staff encargado: puede ver y escribir
+    try:
+        await channel.set_permissions(staff_member,
+            view_channel=True, send_messages=True, read_message_history=True)
+    except Exception:
+        pass
+    # El dueño del ticket: sigue pudiendo escribir
+    if owner:
+        try:
+            await channel.set_permissions(owner,
+                view_channel=True, send_messages=True, read_message_history=True)
+        except Exception:
+            pass
+
+    info["reclamado_por"] = str(staff_member.id)
+    guardar_tickets(tdata)
+
+class TicketCloseModal(discord.ui.Modal, title="Cerrar Ticket"):
+    motivo = discord.ui.TextInput(
+        label="Motivo del cierre",
+        placeholder="Describí brevemente por qué se cierra el ticket...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+
+    def __init__(self, info: dict, channel_id: int):
+        super().__init__()
+        self.ticket_info = info
+        self.channel_id  = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        motivo_txt = self.motivo.value.strip()
+        tdata = cargar_tickets()
+        key = str(self.channel_id)
+        if key in tdata["tickets"]:
+            del tdata["tickets"][key]
+            guardar_tickets(tdata)
+
+        await enviar_log_ticket(interaction.guild, self.ticket_info, motivo_txt, interaction.user)
+
+        await interaction.response.send_message(
+            f"🔒 Ticket cerrado por {interaction.user.mention}.\n📝 Motivo: {motivo_txt}\nEl canal se eliminará en 5 segundos."
+        )
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete()
+        except Exception:
+            pass
 
 class TicketActionView(discord.ui.View):
     def __init__(self):
@@ -64,15 +161,7 @@ class TicketActionView(discord.ui.View):
             return await interaction.response.send_message("❌ Este canal no es un ticket activo.", ephemeral=True)
         if not es_staff(interaction.user) and interaction.user.id != int(info.get("user_id", 0)):
             return await interaction.response.send_message("❌ Solo el dueño o staff puede cerrar este ticket.", ephemeral=True)
-        await interaction.response.defer()
-        del tdata["tickets"][str(interaction.channel_id)]
-        guardar_tickets(tdata)
-        await interaction.channel.send("🔒 Ticket cerrado. El canal se eliminará en 5 segundos.")
-        await asyncio.sleep(5)
-        try:
-            await interaction.channel.delete()
-        except Exception:
-            pass
+        await interaction.response.send_modal(TicketCloseModal(info, interaction.channel_id))
 
     @discord.ui.button(label="✋ Reclamar ticket", style=discord.ButtonStyle.success, custom_id="ticket:reclamar")
     async def reclamar(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -90,10 +179,9 @@ class TicketActionView(discord.ui.View):
                 )
             except Exception:
                 pass
-        info["reclamado_por"] = str(interaction.user.id)
-        guardar_tickets(tdata)
+        await ejecutar_claim(interaction.guild, interaction.channel, interaction.user, info, tdata)
         e = discord.Embed(
-            description=f"✋ {interaction.user.mention} reclamó este ticket y se hará cargo de él.",
+            description=f"✋ {interaction.user.mention} reclamó este ticket.\n🔇 Solo él y el usuario pueden escribir ahora.",
             color=discord.Color.from_str("#27AE60"),
             timestamp=datetime.now(timezone.utc)
         )
@@ -102,21 +190,20 @@ class TicketActionView(discord.ui.View):
 class TicketSelectMenu(discord.ui.Select):
     def __init__(self):
         opciones = [
-            discord.SelectOption(label="Soporte General",    value="soporte",    emoji="🛠️", description="Dudas o problemas generales"),
-            discord.SelectOption(label="Apelar / Reportar",  value="apelar",     emoji="⚖️", description="Apelaciones y reportes"),
-            discord.SelectOption(label="Crear Mafia",        value="mafia",      emoji="🕵️", description="Solicitar la creación de una mafia"),
-            discord.SelectOption(label="Reclamar Beneficios",value="beneficios", emoji="🎁", description="Reclamar rangos, premios u otros beneficios"),
+            discord.SelectOption(label="Soporte General",     value="soporte",    emoji="🛠️", description="Dudas o problemas generales"),
+            discord.SelectOption(label="Apelar / Reportar",   value="apelar",     emoji="⚖️", description="Apelaciones y reportes"),
+            discord.SelectOption(label="Crear Mafia",         value="mafia",      emoji="🕵️", description="Solicitar la creación de una mafia"),
+            discord.SelectOption(label="Reclamar Beneficios", value="beneficios", emoji="🎁", description="Reclamar rangos, premios u otros beneficios"),
         ]
         super().__init__(placeholder="Seleccioná el tipo de ticket…", options=opciones, custom_id="ticket:select")
 
     async def callback(self, interaction: discord.Interaction):
-        tipo_key   = self.values[0]
+        tipo_key          = self.values[0]
         tipo_label, color = TIPOS_TICKET[tipo_key]
-        guild      = interaction.guild
-        categoria  = guild.get_channel(CATEGORIA_TICKETS)
+        guild             = interaction.guild
+        categoria         = guild.get_channel(CATEGORIA_TICKETS)
 
         tdata = cargar_tickets()
-        # Verificar que el usuario no tenga un ticket abierto del mismo tipo
         for ch_id, info in tdata["tickets"].items():
             if info.get("user_id") == str(interaction.user.id) and info.get("tipo") == tipo_label:
                 ch = guild.get_channel(int(ch_id))
@@ -128,30 +215,28 @@ class TicketSelectMenu(discord.ui.Select):
         tdata["counter"] += 1
         num = tdata["counter"]
 
+        staff_role = guild.get_role(STAFF_ROLE_ID)
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             interaction.user:   discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         }
-        staff_role = guild.get_role(STAFF_ROLE_ID)
         if staff_role:
             overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
         canal_nombre = f"ticket-{num:03d}-{interaction.user.name[:12]}"
         try:
             canal = await guild.create_text_channel(
-                name=canal_nombre,
-                category=categoria,
-                overwrites=overwrites,
+                name=canal_nombre, category=categoria, overwrites=overwrites,
                 topic=f"{tipo_label} — {interaction.user} ({interaction.user.id})"
             )
         except discord.Forbidden:
             return await interaction.response.send_message("❌ Sin permisos para crear canales.", ephemeral=True)
 
         tdata["tickets"][str(canal.id)] = {
-            "user_id": str(interaction.user.id),
-            "tipo":    tipo_label,
-            "numero":  num,
-            "fecha":   ts(),
+            "user_id":       str(interaction.user.id),
+            "tipo":          tipo_label,
+            "numero":        num,
+            "fecha":         ts(),
             "reclamado_por": None,
         }
         guardar_tickets(tdata)
@@ -161,15 +246,14 @@ class TicketSelectMenu(discord.ui.Select):
             description=(
                 f"Hola {interaction.user.mention}, gracias por abrir un ticket.\n"
                 "El staff lo atenderá a la brevedad.\n\n"
-                "Usá los botones de abajo para gestionar el ticket."
+                "📌 Usá los botones de abajo para gestionar el ticket."
             ),
-            color=color,
-            timestamp=datetime.now(timezone.utc)
+            color=color, timestamp=datetime.now(timezone.utc)
         )
         e.set_thumbnail(url=interaction.user.display_avatar.url)
         e.add_field(name="👤 Usuario",    value=f"{interaction.user.mention} (`{interaction.user}`)", inline=True)
-        e.add_field(name="📋 Categoría", value=tipo_label, inline=True)
-        e.add_field(name="🆔 Ticket",    value=f"`#{num:03d}`", inline=True)
+        e.add_field(name="📋 Categoría", value=tipo_label,       inline=True)
+        e.add_field(name="🆔 Ticket",    value=f"`#{num:03d}`",  inline=True)
         e.set_footer(text=f"Abierto el {ts()}")
 
         staff_mention = staff_role.mention if staff_role else ""
@@ -186,7 +270,7 @@ async def enviar_panel_tickets(channel, guild):
         title="🎫 Sistema de Tickets",
         description=(
             "¿Necesitás ayuda o tenés alguna solicitud?\n"
-            "Seleccioná la categoría correspondiente en el menú de abajo para abrir un ticket.\n\n"
+            "Seleccioná la categoría en el menú de abajo para abrir un ticket.\n\n"
             "🛠️ **Soporte General** — Dudas y problemas generales\n"
             "⚖️ **Apelar / Reportar** — Apelaciones y reportes\n"
             "🕵️ **Crear Mafia** — Solicitar la creación de una mafia\n"
@@ -431,46 +515,129 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    cmd = message.content.strip().lower()
+    content = message.content.strip()
+    cmd_low = content.lower()
+    is_staff = isinstance(message.author, discord.Member) and es_staff(message.author)
 
-    # --- Comandos de panel (solo staff) ---
-    if cmd == "!verify-panel":
+    # ── Paneles (solo staff, prefijo !) ──────────────────────────────────
+    if cmd_low == "!verify-panel":
         try: await message.delete()
         except Exception: pass
-        if isinstance(message.author, discord.Member) and es_staff(message.author):
+        if is_staff:
             await enviar_panel_verificacion(message.channel, message.guild)
         return
 
-    if cmd == "!ticket-panel":
+    if cmd_low == "!ticket-panel":
         try: await message.delete()
         except Exception: pass
-        if isinstance(message.author, discord.Member) and es_staff(message.author):
+        if is_staff:
             if message.channel.id != 1520869210232979457:
-                try:
-                    await message.channel.send("❌ El panel de tickets solo puede enviarse en <#1520869210232979457>.", delete_after=6)
-                except Exception: pass
+                await message.channel.send(
+                    "❌ El panel de tickets solo puede enviarse en <#1520869210232979457>.", delete_after=6
+                )
             else:
                 await enviar_panel_tickets(message.channel, message.guild)
         return
 
-    # --- !unclaim (solo dentro de un ticket) ---
-    if cmd == "!unclaim":
-        if isinstance(message.author, discord.Member) and es_staff(message.author):
-            tdata = cargar_tickets()
-            info  = tdata["tickets"].get(str(message.channel.id))
-            if not info:
-                return await message.channel.send("❌ Este canal no es un ticket activo.", delete_after=5)
-            if not info.get("reclamado_por"):
-                return await message.channel.send("❌ Este ticket no está reclamado.", delete_after=5)
-            if info["reclamado_por"] != str(message.author.id) and not es_staff(message.author):
-                return await message.channel.send("❌ No eres quien reclamó este ticket.", delete_after=5)
-            info["reclamado_por"] = None
-            guardar_tickets(tdata)
-            await message.channel.send(f"↩️ {message.author.mention} liberó el ticket. Cualquier staff puede reclamarlo.")
+    # ── Comandos de ticket (prefijo ?, solo staff) ───────────────────────
+    if cmd_low == "?claim":
+        if not is_staff:
+            return
+        tdata = cargar_tickets()
+        info  = tdata["tickets"].get(str(message.channel.id))
+        if not info:
+            return await message.channel.send("❌ Este canal no es un ticket activo.", delete_after=5)
+        if info.get("reclamado_por"):
+            try:
+                r = await bot.fetch_user(int(info["reclamado_por"]))
+                return await message.channel.send(f"❌ Ya reclamado por **{r}**.", delete_after=5)
+            except Exception:
+                pass
+        await ejecutar_claim(message.guild, message.channel, message.author, info, tdata)
+        await message.channel.send(
+            f"✋ {message.author.mention} reclamó el ticket.\n🔇 Solo él y el usuario pueden escribir ahora."
+        )
         return
 
-    # --- Auto-mod (ignora staff) ---
-    if isinstance(message.author, discord.Member) and es_staff(message.author):
+    if cmd_low == "?unclaim":
+        if not is_staff:
+            return
+        tdata = cargar_tickets()
+        info  = tdata["tickets"].get(str(message.channel.id))
+        if not info:
+            return await message.channel.send("❌ Este canal no es un ticket activo.", delete_after=5)
+        if not info.get("reclamado_por"):
+            return await message.channel.send("❌ Este ticket no está reclamado.", delete_after=5)
+        # Restaurar permisos: todo el staff puede escribir de nuevo
+        staff_role = message.guild.get_role(STAFF_ROLE_ID)
+        if staff_role:
+            try:
+                await message.channel.set_permissions(staff_role,
+                    view_channel=True, send_messages=True, read_message_history=True)
+            except Exception:
+                pass
+        # Quitar permiso individual del anterior reclamador
+        try:
+            prev = message.guild.get_member(int(info["reclamado_por"]))
+            if prev:
+                await message.channel.set_permissions(prev, overwrite=None)
+        except Exception:
+            pass
+        info["reclamado_por"] = None
+        guardar_tickets(tdata)
+        await message.channel.send(
+            f"↩️ {message.author.mention} liberó el ticket. Cualquier staff puede reclamarlo ahora."
+        )
+        return
+
+    if cmd_low.startswith("?lock"):
+        if not is_staff:
+            return
+        # Uso: ?lock [#canal] [minutos]
+        parts = content.split()
+        target_channel = message.channel
+        minutos = None
+        for p in parts[1:]:
+            # canal mencionado como <#ID>
+            if p.startswith("<#") and p.endswith(">"):
+                cid = int(p[2:-1])
+                ch  = message.guild.get_channel(cid)
+                if ch:
+                    target_channel = ch
+            else:
+                try:
+                    minutos = int(p)
+                except ValueError:
+                    pass
+        try:
+            await target_channel.set_permissions(message.guild.default_role, send_messages=False)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para bloquear ese canal.", delete_after=5)
+        txt = f"🔒 Canal {target_channel.mention} bloqueado por {message.author.mention}."
+        if minutos:
+            txt += f" Se desbloqueará en **{minutos} min**."
+        await message.channel.send(txt)
+        if minutos:
+            await asyncio.sleep(minutos * 60)
+            try:
+                await target_channel.set_permissions(message.guild.default_role, send_messages=True)
+                await message.channel.send(f"🔓 Canal {target_channel.mention} desbloqueado automáticamente.")
+            except Exception:
+                pass
+        return
+
+    if cmd_low == "?unlock":
+        if not is_staff:
+            return
+        try:
+            await message.channel.set_permissions(message.guild.default_role, send_messages=True)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para desbloquear.", delete_after=5)
+        await message.channel.send(f"🔓 Canal desbloqueado por {message.author.mention}.")
+        return
+
+    # ── Auto-mod (ignora staff) ───────────────────────────────────────────
+    if is_staff:
         return
 
     now = discord.utils.utcnow().timestamp()
