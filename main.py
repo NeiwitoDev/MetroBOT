@@ -15,8 +15,27 @@ CANAL_BIENVENIDA     = 1517913637971427401
 CANALES_RECOMENDADOS = [1517913773854429204, 1518288067776090162, 1520857813876867142, 1520869210232979457]
 CATEGORIA_TICKETS    = 1520894082241527999
 CANAL_TICKET_LOGS    = 1520921022289936526
+CANAL_BLACKLIST      = 1520859527531069521
 ROL_VERIFICADO       = 1518285837379571852
 ROL_NO_VERIFICADO    = 1518285884188004494
+
+# Prefijos de rango — orden de prioridad (mayor primero)
+PREFIJOS_ROLES = [
+    (1518313594427674775, "ED"),
+    (1518313784135913574, "SC"),
+    (1518313832643301578, "SA"),
+    (1518313876846809128, "HS"),
+    (1518313935063744654, "DM"),
+    (1518313987568308446, "HA"),
+    (1518314077347123230, "AD"),
+    (1518314163804307476, "ADP"),
+    ( 518314226215555202, "SM"),
+    (1518314282717282404, "MD"),
+    (1518314341055725749, "MDP"),
+    (1518314388954550323, "SP"),
+    (1518314434328662096, "S"),
+    (1518314492361048306, "HEL"),
+]
 
 intents = discord.Intents.default()
 intents.members = True
@@ -39,6 +58,64 @@ def cargar_tickets():
 def guardar_tickets(data):
     with open(TICKETS_FILE, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+
+# --- Warns JSON ---
+WARNS_FILE = "warns.json"
+
+def cargar_warns():
+    if not os.path.exists(WARNS_FILE):
+        return {}
+    with open(WARNS_FILE) as f:
+        return json.load(f)
+
+def guardar_warns(data):
+    with open(WARNS_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def gen_warn_id(lista):
+    return f"#{len(lista) + 1:03d}"
+
+# --- Blacklist JSON ---
+BLACKLIST_FILE = "blacklist.json"
+
+def cargar_blacklist():
+    if not os.path.exists(BLACKLIST_FILE):
+        return {}
+    with open(BLACKLIST_FILE) as f:
+        return json.load(f)
+
+def guardar_blacklist(data):
+    with open(BLACKLIST_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# --- Sistema de prefijos ---
+def obtener_prefijo(member: discord.Member):
+    """Devuelve el prefijo correspondiente al rol más alto del miembro, o None."""
+    role_ids = {r.id for r in member.roles}
+    for rol_id, prefijo in PREFIJOS_ROLES:
+        if rol_id in role_ids:
+            return prefijo
+    return None
+
+def limpiar_prefijo(nick: str) -> str:
+    """Quita cualquier prefijo de rango del apodo."""
+    for _, prefijo in PREFIJOS_ROLES:
+        tag = f"{prefijo} › "
+        if nick.startswith(tag):
+            return nick[len(tag):]
+    return nick
+
+async def actualizar_prefijo(member: discord.Member):
+    """Pone o quita el prefijo de rango en el apodo del miembro."""
+    try:
+        prefijo = obtener_prefijo(member)
+        nombre_base = limpiar_prefijo(member.display_name)
+        nuevo_nick = f"{prefijo} › {nombre_base}" if prefijo else nombre_base
+        # Solo edita si hay un cambio real
+        if member.display_name != nuevo_nick:
+            await member.edit(nick=nuevo_nick)
+    except Exception:
+        pass
 
 # --- Auto-mod ---
 user_msgs = defaultdict(lambda: deque(maxlen=5))
@@ -636,6 +713,193 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"🔓 Canal desbloqueado por {message.author.mention}.")
         return
 
+    # ── ?warn @user motivo ────────────────────────────────────────────────
+    if cmd_low.startswith("?warn "):
+        if not is_staff:
+            return
+        partes = content.split(None, 2)
+        if len(partes) < 3 or not message.mentions:
+            return await message.channel.send("❌ Uso: `?warn @usuario motivo`", delete_after=6)
+        target = message.mentions[0]
+        motivo = partes[2].replace(target.mention, "").strip()
+        if not motivo:
+            return await message.channel.send("❌ Debés escribir un motivo.", delete_after=6)
+        wdata = cargar_warns()
+        uid   = str(target.id)
+        wdata.setdefault(uid, [])
+        wid   = gen_warn_id(wdata[uid])
+        wdata[uid].append({"id": wid, "motivo": motivo, "staff": str(message.author.id), "fecha": ts()})
+        guardar_warns(wdata)
+        e = discord.Embed(
+            title=f"⚠️ Advertencia aplicada — {wid}",
+            color=discord.Color.from_str("#F5A623"),
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="👤 Usuario",  value=f"{target.mention} (`{target}`)", inline=True)
+        e.add_field(name="👮 Staff",    value=message.author.mention,          inline=True)
+        e.add_field(name="🆔 Caso",     value=f"`{wid}`",                      inline=True)
+        e.add_field(name="📝 Motivo",   value=motivo,                          inline=False)
+        e.add_field(name="📊 Total warns", value=f"**{len(wdata[uid])}**",     inline=True)
+        e.set_footer(text=ts())
+        await message.channel.send(embed=e)
+        try:
+            dm = discord.Embed(
+                title="⚠️ Recibiste una advertencia",
+                description=f"**Servidor:** {message.guild.name}\n**Motivo:** {motivo}\n**Caso:** `{wid}`\n**Staff:** {message.author}",
+                color=discord.Color.from_str("#F5A623"),
+                timestamp=datetime.now(timezone.utc)
+            )
+            await target.send(embed=dm)
+        except Exception:
+            pass
+        return
+
+    # ── ?warns @user ──────────────────────────────────────────────────────
+    if cmd_low.startswith("?warns"):
+        if not is_staff:
+            return
+        target = message.mentions[0] if message.mentions else message.author
+        wdata  = cargar_warns()
+        lista  = wdata.get(str(target.id), [])
+        if not lista:
+            return await message.channel.send(f"✅ {target.mention} no tiene advertencias.", delete_after=8)
+        e = discord.Embed(
+            title=f"📋 Warns — {target.display_name}",
+            description=f"Total: **{len(lista)}** advertencia(s)",
+            color=discord.Color.from_str("#F5A623"),
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.set_thumbnail(url=target.display_avatar.url)
+        for w in lista[-10:]:
+            try:
+                st = await bot.fetch_user(int(w["staff"]))
+                st_txt = str(st)
+            except Exception:
+                st_txt = w["staff"]
+            e.add_field(name=f"`{w['id']}` — {w['fecha']}", value=f"**Motivo:** {w['motivo']}\n**Staff:** {st_txt}", inline=False)
+        if len(lista) > 10:
+            e.set_footer(text=f"Mostrando últimas 10 de {len(lista)}")
+        await message.channel.send(embed=e)
+        return
+
+    # ── ?delwarn @user #ID ────────────────────────────────────────────────
+    if cmd_low.startswith("?delwarn "):
+        if not is_staff:
+            return
+        partes = content.split()
+        if len(partes) < 3 or not message.mentions:
+            return await message.channel.send("❌ Uso: `?delwarn @usuario #ID`", delete_after=6)
+        target = message.mentions[0]
+        wid    = partes[-1].upper()
+        if not wid.startswith("#"):
+            wid = "#" + wid
+        wdata = cargar_warns()
+        uid   = str(target.id)
+        antes = len(wdata.get(uid, []))
+        wdata[uid] = [w for w in wdata.get(uid, []) if w["id"] != wid]
+        if len(wdata[uid]) < antes:
+            guardar_warns(wdata)
+            await message.channel.send(f"✅ Warn `{wid}` de {target.mention} eliminado.", delete_after=8)
+        else:
+            await message.channel.send(f"❌ No encontré el warn `{wid}` para {target.mention}.", delete_after=6)
+        return
+
+    # ── ?purge {cantidad} ─────────────────────────────────────────────────
+    if cmd_low.startswith("?purge"):
+        if not is_staff:
+            return
+        partes = content.split()
+        if len(partes) < 2:
+            return await message.channel.send("❌ Uso: `?purge {cantidad}`", delete_after=6)
+        try:
+            cantidad = int(partes[1])
+        except ValueError:
+            return await message.channel.send("❌ La cantidad debe ser un número.", delete_after=6)
+        if not 1 <= cantidad <= 100:
+            return await message.channel.send("❌ Entre 1 y 100 mensajes.", delete_after=6)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        eliminados = await message.channel.purge(limit=cantidad)
+        await message.channel.send(f"🧹 {message.author.mention} eliminó **{len(eliminados)}** mensajes.", delete_after=6)
+        return
+
+    # ── ?blacklist @user motivo evidencia ────────────────────────────────
+    if cmd_low.startswith("?blacklist "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?blacklist @usuario motivo evidencia`", delete_after=6)
+        partes = content.split(None, 3)
+        if len(partes) < 4:
+            return await message.channel.send("❌ Uso: `?blacklist @usuario motivo evidencia`", delete_after=6)
+        target    = message.mentions[0]
+        resto     = partes[3].replace(target.mention, "").strip()
+        sub_p     = resto.split(None, 1)
+        motivo    = sub_p[0] if sub_p else "Sin motivo"
+        evidencia = sub_p[1] if len(sub_p) > 1 else "Sin evidencia"
+
+        bl = cargar_blacklist()
+        bl[str(target.id)] = {
+            "user": str(target),
+            "motivo": motivo,
+            "evidencia": evidencia,
+            "staff": str(message.author.id),
+            "fecha": ts()
+        }
+        guardar_blacklist(bl)
+
+        try:
+            await message.guild.ban(target, reason=f"[Blacklist] {motivo} — por {message.author}", delete_message_days=0)
+        except Exception as ex:
+            return await message.channel.send(f"❌ No pude banear al usuario: `{ex}`", delete_after=8)
+
+        canal_bl = message.guild.get_channel(CANAL_BLACKLIST)
+        if canal_bl:
+            e = discord.Embed(
+                title="🚫 BLACKLIST — Sanción permanente",
+                color=discord.Color.from_str("#D0021B"),
+                timestamp=datetime.now(timezone.utc)
+            )
+            e.set_thumbnail(url=target.display_avatar.url)
+            e.set_author(name=message.guild.name, icon_url=message.guild.icon.url if message.guild.icon else discord.Embed.Empty)
+            e.add_field(name="👤 Usuario",    value=f"{target.mention}\n`{target}` — `{target.id}`", inline=True)
+            e.add_field(name="👮 Ejecutado por", value=f"{message.author.mention}\n`{message.author}`", inline=True)
+            e.add_field(name="📅 Fecha",      value=ts(),       inline=True)
+            e.add_field(name="📝 Motivo",     value=motivo,     inline=False)
+            e.add_field(name="🔗 Evidencia",  value=evidencia,  inline=False)
+            e.set_footer(text="Sanción permanente — No podrá ingresar al servidor.")
+            await canal_bl.send(embed=e)
+
+        await message.channel.send(f"✅ {target.mention} ha sido agregado a la blacklist y baneado.", delete_after=8)
+        return
+
+    # ── ?whitelist {user_id} ──────────────────────────────────────────────
+    if cmd_low.startswith("?whitelist "):
+        if not is_staff:
+            return
+        partes = content.split()
+        if len(partes) < 2:
+            return await message.channel.send("❌ Uso: `?whitelist {ID de usuario}`", delete_after=6)
+        try:
+            uid = int(partes[1])
+        except ValueError:
+            return await message.channel.send("❌ ID inválido.", delete_after=6)
+        try:
+            user = await bot.fetch_user(uid)
+            await message.guild.unban(user, reason=f"Whitelist — por {message.author}")
+        except discord.NotFound:
+            return await message.channel.send("❌ Ese usuario no está baneado.", delete_after=6)
+        except Exception as ex:
+            return await message.channel.send(f"❌ Error: `{ex}`", delete_after=6)
+        bl = cargar_blacklist()
+        bl.pop(str(uid), None)
+        guardar_blacklist(bl)
+        await message.channel.send(f"✅ `{user}` fue removido de la blacklist y desbaneado.", delete_after=8)
+        return
+
     # ── Auto-mod (ignora staff) ───────────────────────────────────────────
     if is_staff:
         return
@@ -665,6 +929,11 @@ async def on_message(message: discord.Message):
                 delete_after=8
             )
         except Exception: pass
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if before.roles != after.roles:
+        await actualizar_prefijo(after)
 
 @bot.event
 async def on_ready():
