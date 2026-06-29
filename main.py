@@ -2,7 +2,7 @@ import os, asyncio, json, discord, threading, secrets, aiohttp
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from discord import app_commands
 from dotenv import load_dotenv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 
 load_dotenv()
@@ -16,8 +16,12 @@ CANALES_RECOMENDADOS = [1517913773854429204, 1518288067776090162, 15208578138768
 CATEGORIA_TICKETS    = 1520894082241527999
 CANAL_TICKET_LOGS    = 1520921022289936526
 CANAL_BLACKLIST      = 1520859527531069521
-ROL_VERIFICADO       = 1518285837379571852
-ROL_NO_VERIFICADO    = 1518285884188004494
+ROL_VERIFICADO        = 1518285837379571852
+ROL_NO_VERIFICADO     = 1518285884188004494
+CANAL_LICENCIAS_PANEL = 1520865765945905193
+CANAL_LICENCIAS_LOGS  = 1520921022289936526
+CANAL_VOTACION        = 1520858733360713829
+ROL_PING_APERTURA     = 1521177084804989171
 
 # Prefijos de rango — orden de prioridad (mayor primero)
 PREFIJOS_ROLES = [
@@ -75,6 +79,19 @@ def guardar_warns(data):
 def gen_warn_id(lista):
     return f"#{len(lista) + 1:03d}"
 
+# --- Notes JSON ---
+NOTES_FILE = "notes.json"
+
+def cargar_notes():
+    if not os.path.exists(NOTES_FILE):
+        return {}
+    with open(NOTES_FILE) as f:
+        return json.load(f)
+
+def guardar_notes(data):
+    with open(NOTES_FILE, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
 # --- Blacklist JSON ---
 BLACKLIST_FILE = "blacklist.json"
 
@@ -118,7 +135,9 @@ async def actualizar_prefijo(member: discord.Member):
         pass
 
 # --- Auto-mod ---
-user_msgs = defaultdict(lambda: deque(maxlen=5))
+user_msgs: dict = defaultdict(lambda: deque(maxlen=5))
+# --- Datos temporales de licencias (multi-paso modal) ---
+licencia_temp: dict = {}
 
 # ─────────────────────────────────────────────
 # SISTEMA DE TICKETS
@@ -546,6 +565,252 @@ async def enviar_panel_verificacion(channel: discord.TextChannel, guild: discord
     await channel.send(embed=e, view=VerifyPanelView())
 
 # ─────────────────────────────────────────────
+# SISTEMA DE LICENCIAS DE CONDUCIR
+# Discord no permite abrir un modal desde on_submit de otro modal.
+# Patrón correcto: cada modal responde con un botón que abre el siguiente.
+# ─────────────────────────────────────────────
+
+# ── Paso 3: último modal → envía al log ──────
+class LicenciaModal3(discord.ui.Modal, title="Solicitud de Licencia — 3/3"):
+    q8 = discord.ui.TextInput(
+        label="¿Ignorar semáforo rojo si no vienen autos?",
+        style=discord.TextStyle.paragraph, required=True, max_length=300,
+        placeholder="Respondé con tus propias palabras..."
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = licencia_temp.pop(interaction.user.id, {})
+        data["q8"] = self.q8.value
+        canal_log = interaction.guild.get_channel(CANAL_LICENCIAS_LOGS)
+        if canal_log:
+            e = discord.Embed(
+                title="📋 Solicitud de Licencia de Conducir",
+                color=discord.Color.from_str("#F5A623"),
+                timestamp=datetime.now(timezone.utc)
+            )
+            e.set_thumbnail(url=interaction.user.display_avatar.url)
+            e.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+            e.add_field(name="👤 Discord",        value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=True)
+            e.add_field(name="📅 Fecha",           value=ts(),                       inline=True)
+            e.add_field(name="\u200b",             value="\u200b",                   inline=True)
+            e.add_field(name="🪪 Nombre (IC)",    value=data.get("nombre","—"),      inline=True)
+            e.add_field(name="🪪 Apellido (IC)",  value=data.get("apellido","—"),    inline=True)
+            e.add_field(name="🔢 Edad (IC)",       value=data.get("edad","—"),       inline=True)
+            e.add_field(name="❓ Semáforo amarillo",      value=data.get("q1","—"),  inline=False)
+            e.add_field(name="❓ Cambiar de carril",      value=data.get("q2","—"),  inline=False)
+            e.add_field(name="❓ Cinturón de seguridad",  value=data.get("q3","—"),  inline=False)
+            e.add_field(name="❓ Alcohol al conducir",    value=data.get("q4","—"),  inline=False)
+            e.add_field(name="❓ Policía ordena detener", value=data.get("q5","—"),  inline=False)
+            e.add_field(name="❓ Maniobras peligrosas",   value=data.get("q6","—"),  inline=False)
+            e.add_field(name="❓ Vehículo de emergencia", value=data.get("q7","—"),  inline=False)
+            e.add_field(name="❓ Semáforo rojo sin autos",value=data.get("q8","—"),  inline=False)
+            e.set_footer(text="Sistema de Licencias — Revisá y aprobá/denegá")
+            await canal_log.send(embed=e)
+        await interaction.response.send_message(
+            "✅ ¡Solicitud enviada! El staff la revisará a la brevedad.", ephemeral=True
+        )
+
+
+# ── Botón que abre Modal 3 ────────────────────
+class LicenciaParte3View(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+
+    async def interaction_check(self, inter: discord.Interaction):
+        if inter.user.id != self.user_id:
+            await inter.response.send_message("❌ Este botón no es para vos.", ephemeral=True)
+            return False
+        if inter.user.id not in licencia_temp:
+            await inter.response.send_message("❌ Tu sesión expiró. Empezá de nuevo.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Continuar — Parte 3/3 ▶", style=discord.ButtonStyle.primary, emoji="📋")
+    async def continuar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        button.disabled = True
+        await interaction.response.send_modal(LicenciaModal3())
+
+
+# ── Paso 2: modal → guarda datos → botón para Modal 3 ──
+class LicenciaModal2(discord.ui.Modal, title="Solicitud de Licencia — 2/3"):
+    q3 = discord.ui.TextInput(label="¿Es obligatorio el cinturón? ¿Por qué?",     style=discord.TextStyle.paragraph, required=True, max_length=300)
+    q4 = discord.ui.TextInput(label="¿Está permitido conducir bajo el alcohol?",   style=discord.TextStyle.paragraph, required=True, max_length=300)
+    q5 = discord.ui.TextInput(label="Un policía te ordena detener. ¿Qué hacés?",  style=discord.TextStyle.paragraph, required=True, max_length=300)
+    q6 = discord.ui.TextInput(label="¿Está permitido hacer maniobras peligrosas?", style=discord.TextStyle.paragraph, required=True, max_length=300)
+    q7 = discord.ui.TextInput(label="¿Qué hacés si pasa un vehículo emergencia?",  style=discord.TextStyle.paragraph, required=True, max_length=300)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = licencia_temp.get(interaction.user.id, {})
+        data.update({
+            "q3": self.q3.value, "q4": self.q4.value, "q5": self.q5.value,
+            "q6": self.q6.value, "q7": self.q7.value,
+        })
+        licencia_temp[interaction.user.id] = data
+        await interaction.response.send_message(
+            "✅ **Parte 2/3 completada.** Presioná el botón para responder la última pregunta.",
+            view=LicenciaParte3View(interaction.user.id),
+            ephemeral=True
+        )
+
+
+# ── Botón que abre Modal 2 ────────────────────
+class LicenciaParte2View(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+
+    async def interaction_check(self, inter: discord.Interaction):
+        if inter.user.id != self.user_id:
+            await inter.response.send_message("❌ Este botón no es para vos.", ephemeral=True)
+            return False
+        if inter.user.id not in licencia_temp:
+            await inter.response.send_message("❌ Tu sesión expiró. Empezá de nuevo.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Continuar — Parte 2/3 ▶", style=discord.ButtonStyle.primary, emoji="📋")
+    async def continuar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        button.disabled = True
+        await interaction.response.send_modal(LicenciaModal2())
+
+
+# ── Paso 1: modal inicial → guarda datos → botón para Modal 2 ──
+class LicenciaModal1(discord.ui.Modal, title="Solicitud de Licencia — 1/3"):
+    nombre   = discord.ui.TextInput(label="Nombre (IC)",   placeholder="Tu nombre en el roleplay",   required=True, max_length=50)
+    apellido = discord.ui.TextInput(label="Apellido (IC)", placeholder="Tu apellido en el roleplay",  required=True, max_length=50)
+    edad     = discord.ui.TextInput(label="Edad (IC)",     placeholder="Tu edad en el roleplay",      required=True, max_length=3)
+    q1       = discord.ui.TextInput(label="¿Qué significa un semáforo en luz amarilla?",  style=discord.TextStyle.paragraph, required=True, max_length=300)
+    q2       = discord.ui.TextInput(label="¿Qué debés hacer antes de cambiar de carril?", style=discord.TextStyle.paragraph, required=True, max_length=300)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        licencia_temp[interaction.user.id] = {
+            "nombre": self.nombre.value, "apellido": self.apellido.value,
+            "edad": self.edad.value, "q1": self.q1.value, "q2": self.q2.value,
+        }
+        await interaction.response.send_message(
+            "✅ **Parte 1/3 completada.** Presioná el botón para continuar con las siguientes preguntas.",
+            view=LicenciaParte2View(interaction.user.id),
+            ephemeral=True
+        )
+
+
+class LicenciaPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Solicitar Licencia", style=discord.ButtonStyle.primary, emoji="📋", custom_id="licencia:solicitar")
+    async def solicitar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LicenciaModal1())
+
+
+async def enviar_panel_licencias(channel, guild):
+    e = discord.Embed(
+        title="🚗 Licencia de Conducir — ¿Cómo obtenerla?",
+        description=(
+            "Para obtener tu **Licencia de Conducir** seguí estos pasos:\n\n"
+            "**1.** Presioná el botón **📋 Solicitar Licencia** de abajo.\n"
+            "**2.** Completá el formulario en **3 partes** con tus datos IC y las preguntas del examen.\n"
+            "**3.** Enviá el formulario — el **staff revisará tu solicitud** y te notificará.\n\n"
+            "📌 **Requisitos**\n"
+            "› Debés estar verificado en el servidor.\n"
+            "› Respondé las preguntas con honestidad y detalle.\n"
+            "› Las respuestas incompletas pueden resultar en denegación.\n\n"
+            "⚠️ El examen consta de **11 preguntas** divididas en 3 formularios."
+        ),
+        color=discord.Color.from_str("#F5A623"),
+        timestamp=datetime.now(timezone.utc)
+    )
+    if guild.icon:
+        e.set_thumbnail(url=guild.icon.url)
+    e.set_footer(text=f"{guild.name} • Sistema de Licencias")
+    await channel.send(embed=e, view=LicenciaPanelView())
+
+
+# ─────────────────────────────────────────────
+# SISTEMA DE APERTURAS / VOTACIÓN
+# ─────────────────────────────────────────────
+class VotacionView(discord.ui.View):
+    def __init__(self, votos_min: int):
+        super().__init__(timeout=None)
+        self.votos_min = votos_min
+        self.si:      set = set()
+        self.despues: set = set()
+        self.no:      set = set()
+        self.mod:     set = set()
+        self.anunciado = False
+        _uid = secrets.token_hex(4)
+        for item in self.children:
+            item.custom_id = f"{item.custom_id}_{_uid}"
+
+    def _remove(self, uid: int):
+        self.si.discard(uid); self.despues.discard(uid)
+        self.no.discard(uid); self.mod.discard(uid)
+
+    def _counts_txt(self):
+        return (
+            f"🟢 **¡Sí! Entrare** — `{len(self.si)}`\n"
+            f"🟡 **Si, pero más tarde** — `{len(self.despues)}`\n"
+            f"🔴 **No entrare** — `{len(self.no)}`\n"
+            f"🛡️ **Voy a moderar** — `{len(self.mod)}`"
+        )
+
+    def _embed(self):
+        e = discord.Embed(
+            title="🗳️ ¿Vas a entrar al servidor?",
+            description=(
+                f"{self._counts_txt()}\n\n"
+                f"**Votos mínimos para abrir:** `{self.votos_min}`\n"
+                "Podés cambiar tu voto en cualquier momento."
+            ),
+            color=discord.Color.from_str("#5865F2"),
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.set_footer(text="Sistema de Aperturas")
+        return e
+
+    async def _check_open(self, interaction: discord.Interaction):
+        if not self.anunciado and len(self.si) >= self.votos_min:
+            self.anunciado = True
+            canal = interaction.guild.get_channel(CANAL_VOTACION)
+            if canal:
+                e = discord.Embed(
+                    title="🟢 ¡EL SERVIDOR ESTÁ ABIERTO!",
+                    description=(
+                        f"<@&{ROL_PING_APERTURA}> ¡El servidor ya está disponible!\n\n"
+                        f"**Resultado de la votación:**\n{self._counts_txt()}"
+                    ),
+                    color=discord.Color.from_str("#27AE60"),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                e.set_footer(text=f"Mínimo alcanzado: {self.votos_min} votos ✅")
+                await canal.send(content=f"<@&{ROL_PING_APERTURA}>", embed=e)
+
+    @discord.ui.button(label="¡Sí! Entrare",       style=discord.ButtonStyle.success,   emoji="🟢", custom_id="vot:si")
+    async def btn_si(self, interaction, button):
+        self._remove(interaction.user.id); self.si.add(interaction.user.id)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+        await self._check_open(interaction)
+
+    @discord.ui.button(label="Si, pero más tarde", style=discord.ButtonStyle.primary,   emoji="🟡", custom_id="vot:despues")
+    async def btn_despues(self, interaction, button):
+        self._remove(interaction.user.id); self.despues.add(interaction.user.id)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="No entrare",          style=discord.ButtonStyle.danger,    emoji="🔴", custom_id="vot:no")
+    async def btn_no(self, interaction, button):
+        self._remove(interaction.user.id); self.no.add(interaction.user.id)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="Voy a moderar!",      style=discord.ButtonStyle.secondary, emoji="🛡️", custom_id="vot:mod")
+    async def btn_mod(self, interaction, button):
+        if not (isinstance(interaction.user, discord.Member) and es_staff(interaction.user)):
+            return await interaction.response.send_message("❌ Solo el staff puede usar esta opción.", ephemeral=True)
+        self._remove(interaction.user.id); self.mod.add(interaction.user.id)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+
+# ─────────────────────────────────────────────
 # KEEP-ALIVE PING (cada 5 minutos)
 # ─────────────────────────────────────────────
 async def keepalive_task():
@@ -597,6 +862,18 @@ async def on_message(message: discord.Message):
     is_staff = isinstance(message.author, discord.Member) and es_staff(message.author)
 
     # ── Paneles (solo staff, prefijo !) ──────────────────────────────────
+    if cmd_low == "!licencias-panel":
+        try: await message.delete()
+        except Exception: pass
+        if not is_staff:
+            return
+        if message.channel.id != CANAL_LICENCIAS_PANEL:
+            return await message.channel.send(
+                f"❌ El panel de licencias solo puede enviarse en <#{CANAL_LICENCIAS_PANEL}>.", delete_after=6
+            )
+        await enviar_panel_licencias(message.channel, message.guild)
+        return
+
     if cmd_low == "!verify-panel":
         try: await message.delete()
         except Exception: pass
@@ -900,6 +1177,535 @@ async def on_message(message: discord.Message):
         await message.channel.send(f"✅ `{user}` fue removido de la blacklist y desbaneado.", delete_after=8)
         return
 
+    # ── ?kick @user [motivo] ─────────────────────────────────────────────
+    if cmd_low.startswith("?kick "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?kick @usuario [motivo]`", delete_after=6)
+        target = message.mentions[0]
+        partes = content.split(None, 2)
+        motivo = (partes[2] if len(partes) >= 3 else "").replace(target.mention, "").strip() or "Sin motivo"
+        try:
+            dm = discord.Embed(title="👢 Fuiste expulsado/a",
+                description=f"**Servidor:** {message.guild.name}\n**Motivo:** {motivo}\n**Staff:** {message.author}",
+                color=discord.Color.from_str("#E67E22"), timestamp=datetime.now(timezone.utc))
+            await target.send(embed=dm)
+        except Exception: pass
+        try:
+            await target.kick(reason=f"{motivo} — por {message.author}")
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para expulsar.", delete_after=6)
+        e = discord.Embed(title="👢 Usuario expulsado", color=discord.Color.from_str("#E67E22"), timestamp=datetime.now(timezone.utc))
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="👤 Usuario", value=f"{target.mention} (`{target}`)", inline=True)
+        e.add_field(name="👮 Staff",   value=message.author.mention, inline=True)
+        e.add_field(name="📝 Motivo",  value=motivo, inline=False)
+        e.set_footer(text=ts())
+        await message.channel.send(embed=e)
+        return
+
+    # ── ?ban @user [motivo] ──────────────────────────────────────────────
+    if cmd_low.startswith("?ban "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?ban @usuario [motivo]`", delete_after=6)
+        target = message.mentions[0]
+        partes = content.split(None, 2)
+        motivo = (partes[2] if len(partes) >= 3 else "").replace(target.mention, "").strip() or "Sin motivo"
+        try:
+            dm = discord.Embed(title="🔨 Fuiste baneado/a",
+                description=f"**Servidor:** {message.guild.name}\n**Motivo:** {motivo}\n**Staff:** {message.author}",
+                color=discord.Color.from_str("#D0021B"), timestamp=datetime.now(timezone.utc))
+            await target.send(embed=dm)
+        except Exception: pass
+        try:
+            await message.guild.ban(target, reason=f"{motivo} — por {message.author}", delete_message_days=0)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para banear.", delete_after=6)
+        e = discord.Embed(title="🔨 Usuario baneado", color=discord.Color.from_str("#D0021B"), timestamp=datetime.now(timezone.utc))
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="👤 Usuario", value=f"{target.mention} (`{target}`)", inline=True)
+        e.add_field(name="👮 Staff",   value=message.author.mention, inline=True)
+        e.add_field(name="📝 Motivo",  value=motivo, inline=False)
+        e.set_footer(text=ts())
+        await message.channel.send(embed=e)
+        return
+
+    # ── ?tempban @user {minutos} [motivo] ────────────────────────────────
+    if cmd_low.startswith("?tempban "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?tempban @usuario {minutos} [motivo]`", delete_after=6)
+        target = message.mentions[0]
+        args = [p for p in content.split()[1:] if not p.startswith("<@")]
+        if not args:
+            return await message.channel.send("❌ Uso: `?tempban @usuario {minutos} [motivo]`", delete_after=6)
+        try:
+            minutos = int(args[0])
+        except ValueError:
+            return await message.channel.send("❌ Los minutos deben ser un número.", delete_after=6)
+        motivo = " ".join(args[1:]) or "Sin motivo"
+        try:
+            dm = discord.Embed(title="⏳ Ban temporal",
+                description=f"**Servidor:** {message.guild.name}\n**Duración:** {minutos} min\n**Motivo:** {motivo}\n**Staff:** {message.author}",
+                color=discord.Color.from_str("#E67E22"), timestamp=datetime.now(timezone.utc))
+            await target.send(embed=dm)
+        except Exception: pass
+        try:
+            await message.guild.ban(target, reason=f"[TempBan {minutos}min] {motivo} — por {message.author}", delete_message_days=0)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para banear.", delete_after=6)
+        e = discord.Embed(title="⏳ Ban temporal aplicado", color=discord.Color.from_str("#E67E22"), timestamp=datetime.now(timezone.utc))
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="👤 Usuario",   value=f"{target.mention} (`{target}`)", inline=True)
+        e.add_field(name="👮 Staff",     value=message.author.mention, inline=True)
+        e.add_field(name="⏱️ Duración", value=f"**{minutos} min**", inline=True)
+        e.add_field(name="📝 Motivo",    value=motivo, inline=False)
+        e.set_footer(text=ts())
+        await message.channel.send(embed=e)
+        asyncio.create_task(_auto_unban(message.guild, target.id, minutos, message.channel))
+        return
+
+    # ── ?mute @user {minutos} [motivo] ───────────────────────────────────
+    if cmd_low.startswith("?mute "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?mute @usuario {minutos} [motivo]`", delete_after=6)
+        target = message.mentions[0]
+        args = [p for p in content.split()[1:] if not p.startswith("<@")]
+        if not args:
+            return await message.channel.send("❌ Uso: `?mute @usuario {minutos} [motivo]`", delete_after=6)
+        try:
+            minutos = int(args[0])
+        except ValueError:
+            return await message.channel.send("❌ Los minutos deben ser un número.", delete_after=6)
+        motivo = " ".join(args[1:]) or "Sin motivo"
+        until = datetime.now(timezone.utc) + timedelta(minutes=minutos)
+        try:
+            await target.timeout(until, reason=f"{motivo} — por {message.author}")
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para silenciar.", delete_after=6)
+        e = discord.Embed(title="🔇 Usuario silenciado", color=discord.Color.from_str("#95A5A6"), timestamp=datetime.now(timezone.utc))
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="👤 Usuario",   value=f"{target.mention} (`{target}`)", inline=True)
+        e.add_field(name="👮 Staff",     value=message.author.mention, inline=True)
+        e.add_field(name="⏱️ Duración", value=f"**{minutos} min**", inline=True)
+        e.add_field(name="📝 Motivo",    value=motivo, inline=False)
+        e.set_footer(text=ts())
+        await message.channel.send(embed=e)
+        try:
+            dm = discord.Embed(title="🔇 Fuiste silenciado/a",
+                description=f"**Servidor:** {message.guild.name}\n**Duración:** {minutos} min\n**Motivo:** {motivo}\n**Staff:** {message.author}",
+                color=discord.Color.from_str("#95A5A6"), timestamp=datetime.now(timezone.utc))
+            await target.send(embed=dm)
+        except Exception: pass
+        return
+
+    # ── ?unmute @user ─────────────────────────────────────────────────────
+    if cmd_low.startswith("?unmute "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?unmute @usuario`", delete_after=6)
+        target = message.mentions[0]
+        try:
+            await target.timeout(None, reason=f"Unmute — por {message.author}")
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para quitar el silencio.", delete_after=6)
+        await message.channel.send(f"🔊 {target.mention} fue dessilenciado/a por {message.author.mention}.", delete_after=8)
+        return
+
+    # ── ?reset-count ──────────────────────────────────────────────────────
+    if cmd_low == "?reset-count":
+        ROL_RESET = 1521182308072161351
+        if not any(r.id == ROL_RESET for r in message.author.roles):
+            return await message.channel.send("❌ No tenés permisos para usar este comando.", delete_after=6)
+        tdata = cargar_tickets()
+        activos = {k: v for k, v in tdata.get("tickets", {}).items()
+                   if message.guild.get_channel(int(k))}
+        if activos:
+            return await message.channel.send(
+                f"❌ Hay **{len(activos)}** ticket(s) activo(s). Cerrá todos antes de resetear el contador.",
+                delete_after=8
+            )
+
+        class ConfirmarResetView(discord.ui.View):
+            def __init__(self, author_id):
+                super().__init__(timeout=30)
+                self.author_id = author_id
+                self.resultado = None
+
+            async def interaction_check(self, inter: discord.Interaction):
+                if inter.user.id != self.author_id:
+                    await inter.response.send_message("❌ Este botón no es para vos.", ephemeral=True)
+                    return False
+                return True
+
+            @discord.ui.button(label="✅ Confirmar", style=discord.ButtonStyle.danger)
+            async def confirmar(self, inter: discord.Interaction, btn):
+                self.resultado = True
+                tdata2 = cargar_tickets()
+                tdata2["counter"] = 0
+                guardar_tickets(tdata2)
+                for item in self.children:
+                    item.disabled = True
+                await inter.response.edit_message(
+                    content="✅ Contador de tickets reseteado a **0** correctamente.", view=self
+                )
+                self.stop()
+
+            @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.secondary)
+            async def cancelar(self, inter: discord.Interaction, btn):
+                self.resultado = False
+                for item in self.children:
+                    item.disabled = True
+                await inter.response.edit_message(content="↩️ Reset cancelado.", view=self)
+                self.stop()
+
+            async def on_timeout(self):
+                pass
+
+        view = ConfirmarResetView(message.author.id)
+        await message.channel.send(
+            f"⚠️ {message.author.mention} ¿Seguro que querés resetear el contador de tickets a **0**?\n"
+            "Esta acción no se puede deshacer. Tenés **30 segundos** para confirmar.",
+            view=view
+        )
+        return
+
+    # ── ?nick @u {apodo} ─────────────────────────────────────────────────
+    if cmd_low.startswith("?nick "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?nick @usuario nuevo apodo`", delete_after=6)
+        target = message.mentions[0]
+        partes = content.split(None, 2)
+        nuevo = (partes[2] if len(partes) >= 3 else "").replace(target.mention, "").strip()
+        if not nuevo:
+            return await message.channel.send("❌ Escribí el nuevo apodo.", delete_after=6)
+        viejo = target.display_name
+        try:
+            await target.edit(nick=nuevo)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para cambiar ese apodo.", delete_after=6)
+        await message.channel.send(f"✏️ Apodo de {target.mention} cambiado de `{viejo}` → `{nuevo}`.", delete_after=8)
+        return
+
+    # ── ?dm @u {mensaje} ─────────────────────────────────────────────────
+    if cmd_low.startswith("?dm "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?dm @usuario mensaje`", delete_after=6)
+        target = message.mentions[0]
+        partes = content.split(None, 2)
+        texto = (partes[2] if len(partes) >= 3 else "").replace(target.mention, "").strip()
+        if not texto:
+            return await message.channel.send("❌ Escribí el mensaje.", delete_after=6)
+        e = discord.Embed(
+            title=f"📩 Mensaje del staff — {message.guild.name}",
+            description=texto,
+            color=discord.Color.from_str("#5865F2"),
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.set_footer(text=f"Enviado por {message.author}")
+        try:
+            await target.send(embed=e)
+            await message.channel.send(f"✅ DM enviado a {target.mention}.", delete_after=6)
+        except discord.Forbidden:
+            await message.channel.send(f"❌ No pude enviar DM a {target.mention} (tiene los DMs cerrados).", delete_after=6)
+        return
+
+    # ── ?banear-id {ID} [motivo] ──────────────────────────────────────────
+    if cmd_low.startswith("?banear-id "):
+        if not is_staff:
+            return
+        partes = content.split(None, 2)
+        if len(partes) < 2:
+            return await message.channel.send("❌ Uso: `?banear-id {ID} [motivo]`", delete_after=6)
+        try:
+            uid = int(partes[1])
+        except ValueError:
+            return await message.channel.send("❌ ID inválido.", delete_after=6)
+        motivo = partes[2] if len(partes) >= 3 else "Sin motivo"
+        try:
+            user = await bot.fetch_user(uid)
+        except discord.NotFound:
+            return await message.channel.send("❌ No encontré un usuario con ese ID.", delete_after=6)
+        try:
+            await message.guild.ban(user, reason=f"{motivo} — por {message.author}", delete_message_days=0)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para banear.", delete_after=6)
+        except discord.HTTPException:
+            return await message.channel.send("❌ Error al banear. ¿Ya estaba baneado?", delete_after=6)
+        e = discord.Embed(
+            title="🔨 Usuario baneado por ID",
+            color=discord.Color.from_str("#D0021B"),
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.add_field(name="👤 Usuario", value=f"`{user}` — `{uid}`", inline=True)
+        e.add_field(name="👮 Staff",   value=message.author.mention, inline=True)
+        e.add_field(name="📝 Motivo",  value=motivo, inline=False)
+        e.set_footer(text=ts())
+        await message.channel.send(embed=e)
+        return
+
+    # ── ?unban {ID} ───────────────────────────────────────────────────────
+    if cmd_low.startswith("?unban "):
+        if not is_staff:
+            return
+        partes = content.split()
+        if len(partes) < 2:
+            return await message.channel.send("❌ Uso: `?unban {ID}`", delete_after=6)
+        try:
+            uid = int(partes[1])
+        except ValueError:
+            return await message.channel.send("❌ ID inválido.", delete_after=6)
+        try:
+            user = await bot.fetch_user(uid)
+            await message.guild.unban(user, reason=f"Unban manual — por {message.author}")
+        except discord.NotFound:
+            return await message.channel.send("❌ Ese usuario no está baneado o no existe.", delete_after=6)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para desbanear.", delete_after=6)
+        await message.channel.send(f"✅ `{user}` fue desbaneado/a por {message.author.mention}.", delete_after=8)
+        return
+
+    # ── ?note @u {nota} ───────────────────────────────────────────────────
+    if cmd_low.startswith("?note "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?note @usuario texto de la nota`", delete_after=6)
+        target = message.mentions[0]
+        partes = content.split(None, 2)
+        texto = (partes[2] if len(partes) >= 3 else "").replace(target.mention, "").strip()
+        if not texto:
+            return await message.channel.send("❌ Escribí el contenido de la nota.", delete_after=6)
+        ndata = cargar_notes()
+        uid   = str(target.id)
+        ndata.setdefault(uid, [])
+        nid   = f"#{len(ndata[uid]) + 1:03d}"
+        ndata[uid].append({"id": nid, "nota": texto, "staff": str(message.author.id), "fecha": ts()})
+        guardar_notes(ndata)
+        await message.channel.send(
+            f"📝 Nota `{nid}` agregada a {target.mention}. Total: **{len(ndata[uid])}** nota(s).", delete_after=8
+        )
+        return
+
+    # ── ?delnote @u #ID ───────────────────────────────────────────────────
+    if cmd_low.startswith("?delnote "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?delnote @usuario #ID`", delete_after=6)
+        target = message.mentions[0]
+        partes = content.split()
+        nid    = partes[-1].upper()
+        if not nid.startswith("#"):
+            nid = "#" + nid
+        ndata = cargar_notes()
+        uid   = str(target.id)
+        antes = len(ndata.get(uid, []))
+        ndata[uid] = [n for n in ndata.get(uid, []) if n["id"] != nid]
+        if len(ndata.get(uid, [])) < antes:
+            guardar_notes(ndata)
+            await message.channel.send(f"✅ Nota `{nid}` de {target.mention} eliminada.", delete_after=8)
+        else:
+            await message.channel.send(f"❌ No encontré la nota `{nid}` para {target.mention}.", delete_after=6)
+        return
+
+    # ── ?serverinfo ───────────────────────────────────────────────────────
+    if cmd_low == "?serverinfo":
+        if not is_staff:
+            return
+        g = message.guild
+        miembros_reales = sum(1 for m in g.members if not m.bot)
+        bots            = sum(1 for m in g.members if m.bot)
+        canales_texto   = len(g.text_channels)
+        canales_voz     = len(g.voice_channels)
+        roles           = len(g.roles) - 1
+        e = discord.Embed(
+            title=f"📊 Información del Servidor",
+            color=discord.Color.from_str("#5865F2"),
+            timestamp=datetime.now(timezone.utc)
+        )
+        if g.icon:
+            e.set_thumbnail(url=g.icon.url)
+        e.add_field(name="🏷️ Nombre",       value=g.name,                           inline=True)
+        e.add_field(name="🆔 ID",            value=f"`{g.id}`",                      inline=True)
+        e.add_field(name="👑 Dueño",         value=f"<@{g.owner_id}>",              inline=True)
+        e.add_field(name="👥 Miembros",      value=f"**{miembros_reales}** usuarios + **{bots}** bots", inline=True)
+        e.add_field(name="💬 Canales texto", value=f"**{canales_texto}**",           inline=True)
+        e.add_field(name="🔊 Canales voz",   value=f"**{canales_voz}**",             inline=True)
+        e.add_field(name="🎭 Roles",         value=f"**{roles}**",                   inline=True)
+        e.add_field(name="🌍 Región",        value="Automática",                     inline=True)
+        e.add_field(name="📅 Creado el",     value=g.created_at.strftime("%d/%m/%Y"), inline=True)
+        e.set_footer(text=f"Solicitado por {message.author} • {ts()}")
+        await message.channel.send(embed=e)
+        return
+
+    # ── ?userinfo [@u] ────────────────────────────────────────────────────
+    if cmd_low.startswith("?userinfo"):
+        if not is_staff:
+            return
+        target = message.mentions[0] if message.mentions else message.author
+        wdata  = cargar_warns()
+        ndata  = cargar_notes()
+        warns  = len(wdata.get(str(target.id), []))
+        notas  = len(ndata.get(str(target.id), []))
+        roles_txt = ", ".join(r.mention for r in reversed(target.roles) if r.name != "@everyone") or "Ninguno"
+        joined = target.joined_at.strftime("%d/%m/%Y %H:%M") if target.joined_at else "—"
+        created = target.created_at.strftime("%d/%m/%Y %H:%M")
+        estado = str(target.status).capitalize() if hasattr(target, "status") else "—"
+        e = discord.Embed(
+            title=f"👤 Info — {target.display_name}",
+            color=target.color if target.color != discord.Color.default() else discord.Color.from_str("#5865F2"),
+            timestamp=datetime.now(timezone.utc)
+        )
+        e.set_thumbnail(url=target.display_avatar.url)
+        e.add_field(name="🏷️ Tag",        value=f"`{target}`",       inline=True)
+        e.add_field(name="🆔 ID",          value=f"`{target.id}`",   inline=True)
+        e.add_field(name="🤖 Bot",         value="Sí" if target.bot else "No", inline=True)
+        e.add_field(name="📅 Cuenta creada", value=created,          inline=True)
+        e.add_field(name="📥 Entró al servidor", value=joined,        inline=True)
+        e.add_field(name="🌐 Estado",      value=estado,             inline=True)
+        e.add_field(name="⚠️ Warns",      value=f"**{warns}**",      inline=True)
+        e.add_field(name="📝 Notas internas", value=f"**{notas}**",  inline=True)
+        e.add_field(name="\u200b",         value="\u200b",           inline=True)
+        e.add_field(name=f"🎭 Roles ({len(target.roles)-1})", value=roles_txt[:1024], inline=False)
+        e.set_footer(text=f"Solicitado por {message.author} • {ts()}")
+        await message.channel.send(embed=e)
+        return
+
+    # ── ?slowmode {seg} ───────────────────────────────────────────────────
+    if cmd_low.startswith("?slowmode"):
+        if not is_staff:
+            return
+        partes = content.split()
+        if len(partes) < 2:
+            return await message.channel.send("❌ Uso: `?slowmode {segundos}` (0 = desactivar)", delete_after=6)
+        try:
+            seg = int(partes[1])
+        except ValueError:
+            return await message.channel.send("❌ Los segundos deben ser un número.", delete_after=6)
+        if not 0 <= seg <= 21600:
+            return await message.channel.send("❌ Entre 0 y 21600 segundos.", delete_after=6)
+        try:
+            await message.channel.edit(slowmode_delay=seg)
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para cambiar el slowmode.", delete_after=6)
+        if seg == 0:
+            await message.channel.send(f"🐇 Modo lento **desactivado** por {message.author.mention}.", delete_after=8)
+        else:
+            await message.channel.send(f"🐢 Modo lento activado: **{seg}s** por {message.author.mention}.", delete_after=8)
+        return
+
+    # ── ?clear-warns @u ───────────────────────────────────────────────────
+    if cmd_low.startswith("?clear-warns"):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?clear-warns @usuario`", delete_after=6)
+        target = message.mentions[0]
+        wdata  = cargar_warns()
+        uid    = str(target.id)
+        total  = len(wdata.get(uid, []))
+        if total == 0:
+            return await message.channel.send(f"ℹ️ {target.mention} no tiene advertencias.", delete_after=6)
+        wdata[uid] = []
+        guardar_warns(wdata)
+        await message.channel.send(
+            f"🧹 Se eliminaron **{total}** advertencia(s) de {target.mention}.", delete_after=8
+        )
+        return
+
+    # ── ?move @u #canal-de-voz ────────────────────────────────────────────
+    if cmd_low.startswith("?move "):
+        if not is_staff:
+            return
+        if not message.mentions:
+            return await message.channel.send("❌ Uso: `?move @usuario #canal-de-voz`", delete_after=6)
+        target = message.mentions[0]
+        if not target.voice or not target.voice.channel:
+            return await message.channel.send(f"❌ {target.mention} no está en ningún canal de voz.", delete_after=6)
+        canal_destino = None
+        for p in content.split()[1:]:
+            if p.startswith("<#") and p.endswith(">"):
+                cid = int(p[2:-1])
+                ch  = message.guild.get_channel(cid)
+                if ch and isinstance(ch, discord.VoiceChannel):
+                    canal_destino = ch
+                    break
+        if not canal_destino:
+            return await message.channel.send("❌ Mencioná un canal de voz válido con `#`.", delete_after=6)
+        origen = target.voice.channel.name
+        try:
+            await target.move_to(canal_destino, reason=f"Move por {message.author}")
+        except discord.Forbidden:
+            return await message.channel.send("❌ Sin permisos para mover al usuario.", delete_after=6)
+        await message.channel.send(
+            f"🔀 {target.mention} movido de **{origen}** → **{canal_destino.name}** por {message.author.mention}.",
+            delete_after=8
+        )
+        return
+
+    # ── ?cmds ─────────────────────────────────────────────────────────────
+    if cmd_low in ("?cmds", "?comandos", "?help"):
+        if not is_staff:
+            return
+        e = discord.Embed(title="📋 Comandos del Bot", color=discord.Color.from_str("#5865F2"), timestamp=datetime.now(timezone.utc))
+        e.add_field(name="🎫 Tickets", value="`?claim` `?unclaim`", inline=False)
+        e.add_field(name="🔒 Canal", value=(
+            "`?lock [#canal] [min]` — Bloquear\n"
+            "`?unlock` — Desbloquear\n"
+            "`?purge {n}` — Borrar mensajes (1–100)\n"
+            "`?slowmode {seg}` — Modo lento (0 = off)"
+        ), inline=False)
+        e.add_field(name="⚠️ Sanciones", value=(
+            "`?warn @u motivo` — Advertir\n"
+            "`?warns @u` — Ver advertencias\n"
+            "`?delwarn @u #ID` — Borrar advertencia\n"
+            "`?clear-warns @u` — Borrar todos los warns\n"
+            "`?kick @u [motivo]` — Expulsar\n"
+            "`?ban @u [motivo]` — Banear\n"
+            "`?banear-id {ID} [motivo]` — Banear por ID\n"
+            "`?tempban @u {min} [motivo]` — Ban temporal\n"
+            "`?unban {ID}` — Desbanear por ID\n"
+            "`?mute @u {min} [motivo]` — Silenciar\n"
+            "`?unmute @u` — Dessilenciar\n"
+            "`?blacklist @u motivo evidencia` — Blacklistear\n"
+            "`?whitelist {ID}` — Quitar blacklist"
+        ), inline=False)
+        e.add_field(name="👤 Usuarios", value=(
+            "`?nick @u {apodo}` — Cambiar apodo\n"
+            "`?dm @u {msg}` — Enviar DM desde el bot\n"
+            "`?move @u #voz` — Mover canal de voz\n"
+            "`?userinfo [@u]` — Info detallada de usuario\n"
+            "`?serverinfo` — Info del servidor"
+        ), inline=False)
+        e.add_field(name="📝 Notas internas", value=(
+            "`?note @u {texto}` — Agregar nota\n"
+            "`?delnote @u #ID` — Borrar nota"
+        ), inline=False)
+        e.add_field(name="📋 Paneles (!)", value=(
+            "`!verify-panel` — Verificación Roblox\n"
+            "`!ticket-panel` — Tickets\n"
+            "`!licencias-panel` — Licencias de conducir"
+        ), inline=False)
+        e.add_field(name="🗳️ Aperturas (slash)", value=(
+            "`/abrir-votacion {votos}` — Iniciar votación\n"
+            "`/cerrar-servidor` — Cerrar servidor"
+        ), inline=False)
+        e.set_footer(text=f"Solicitado por {message.author} • {ts()}")
+        await message.channel.send(embed=e)
+        return
+
     # ── Auto-mod (ignora staff) ───────────────────────────────────────────
     if is_staff:
         return
@@ -930,6 +1736,61 @@ async def on_message(message: discord.Message):
             )
         except Exception: pass
 
+async def _auto_unban(guild: discord.Guild, user_id: int, minutos: int, canal):
+    await asyncio.sleep(minutos * 60)
+    try:
+        user = await bot.fetch_user(user_id)
+        await guild.unban(user, reason="TempBan expirado")
+        try:
+            await canal.send(f"🔓 Ban temporal de **{user}** expirado. Fue desbaneado/a.", delete_after=10)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+# ─────────────────────────────────────────────
+# COMANDOS SLASH
+# ─────────────────────────────────────────────
+@tree.command(name="abrir-votacion", description="Inicia una votación de apertura del servidor")
+@app_commands.describe(votos="Cantidad mínima de votos ¡Sí! para abrir el servidor")
+async def cmd_abrir_votacion(interaction: discord.Interaction, votos: int):
+    if not (isinstance(interaction.user, discord.Member) and es_staff(interaction.user)):
+        return await interaction.response.send_message("❌ Solo el staff puede usar este comando.", ephemeral=True)
+    if votos < 1:
+        return await interaction.response.send_message("❌ El mínimo debe ser al menos 1.", ephemeral=True)
+    canal = interaction.guild.get_channel(CANAL_VOTACION)
+    if not canal:
+        return await interaction.response.send_message("❌ No encontré el canal de votación.", ephemeral=True)
+    view = VotacionView(votos)
+    await canal.send(embed=view._embed(), view=view)
+    await interaction.response.send_message(
+        f"✅ Votación iniciada en {canal.mention}. Se necesitan **{votos}** votos para abrir.", ephemeral=True
+    )
+
+
+@tree.command(name="cerrar-servidor", description="Anuncia el cierre del servidor")
+async def cmd_cerrar_servidor(interaction: discord.Interaction):
+    if not (isinstance(interaction.user, discord.Member) and es_staff(interaction.user)):
+        return await interaction.response.send_message("❌ Solo el staff puede usar este comando.", ephemeral=True)
+    canal = interaction.guild.get_channel(CANAL_VOTACION)
+    if not canal:
+        return await interaction.response.send_message("❌ No encontré el canal de anuncios.", ephemeral=True)
+    e = discord.Embed(
+        title="🔴 EL SERVIDOR ESTÁ CERRADO",
+        description=(
+            f"El servidor ha sido cerrado por {interaction.user.mention}.\n\n"
+            "Gracias a todos los que participaron. ¡Hasta la próxima apertura!"
+        ),
+        color=discord.Color.from_str("#D0021B"),
+        timestamp=datetime.now(timezone.utc)
+    )
+    if interaction.guild.icon:
+        e.set_thumbnail(url=interaction.guild.icon.url)
+    e.set_footer(text=f"Cerrado por {interaction.user} • {ts()}")
+    await canal.send(embed=e)
+    await interaction.response.send_message("✅ Servidor marcado como cerrado.", ephemeral=True)
+
+
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     if before.roles != after.roles:
@@ -940,6 +1801,7 @@ async def on_ready():
     bot.add_view(VerifyPanelView())
     bot.add_view(TicketPanelView())
     bot.add_view(TicketActionView())
+    bot.add_view(LicenciaPanelView())
     asyncio.create_task(keepalive_task())
     await tree.sync()
     print(f"✅ {bot.user} listo | Servidores: {len(bot.guilds)}")

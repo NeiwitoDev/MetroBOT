@@ -1,4 +1,12 @@
 {
-  "counter": 0,
-  "tickets": {}
+  "counter": 1,
+  "tickets": {
+    "1521183675801145444": {
+      "user_id": "1389732344977428673",
+      "tipo": "⚖️ Apelar / Reportar",
+      "numero": 1,
+      "fecha": "29/06/2026 16:00",
+      "reclamado_por": null
+    }
+  }
 }
